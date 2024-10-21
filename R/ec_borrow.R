@@ -520,26 +520,6 @@ ec_borrow <- function(
     gamma_sel <- 0
   }
 
-  if (identical(method, "AdaLasso Selective Borrow ACW")) { # Chenyin's method
-    rlang::check_installed("SelectiveIntegrative", reason = "to use `srEC()`")
-    est_fun <- function(dat) {
-      fit <- with(dat,
-                  SelectiveIntegrative::srEC(
-                    data_rt = list(X = X[S == 1,], Y = Y[S == 1], A = A[S == 1]),
-                    data_ec = list(list(X = X[S == 0,], Y = Y[S == 0], A = A[S == 0])),
-                    method = "glm"
-                  )
-      )
-      tibble(
-        est = as.vector(fit$est$ACW.final),
-        se = as.vector(fit$sd$ACW.final) / sqrt(fit$n_c),
-        ess_sel = NA,
-        id_sel = list(which(dat$S == 0)[fit$subset.idx])
-      )
-    }
-    gamma_sel <- NA
-  }
-
   if (identical(method, c("Conformal Selective Borrow AIPW"))) { # proposed method
     # est_fun
     est_fun <- function(dat) {
