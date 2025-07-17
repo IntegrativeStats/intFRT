@@ -9,28 +9,29 @@
 #'   data, 0 for external control data).
 #' @param X Matrix of covariates.
 #' @param family A description of the outcome type. Default is "gaussian" for
-#'   continuous outcomes, but can also be "binomial" for binary outcomes.
+#'   continuous outcomes.
 #' @param gamma_grid Numeric vector representing the grid of potential gamma
 #'   values to search over. Default is a sequence from 0 to 1 with 11 grids.
-#' @param measure The performance metric to be minimized. Default is "mse_hat".
-#'   Other options include "var_hat" and "bias2_hat", but these are only for
-#'   comparison purposes and not recommended for actual selection.
-#' @param n_rep_gamma Integer specifying the number of data-splitting iterations
-#'   for estimating the measure given a certain gamma. Default is 100.
+#' @param n_rep_gamma Integer specifying the number of resampling iterations
+#'   for estimating the MSE given a certain gamma. Default is `10`.
 #' @param parallel Logical value indicating whether to use parallel computing.
 #'   Default is `FALSE`.
 #' @param n_cores Integer specifying the number of cores to use for parallel
 #'   computing. Default is the number of available physical cores on the
-#'   machine, as determined by `parallel::detectCores(logical = FALSE)`.
+#'   machine, as determined by `future::availableCores(logical = FALSE)`.
+#' @param opt Character specifying the criterion to determine gamma. Options are
+#' "power" or "mse". Default is "mse".
+#' @param sig_level Numeric value indicating the significance level for
+#' hypothesis tests when `opt = "power"`. Default is 0.05.
 #' @param ... Additional arguments passed to the internal `ec_borrow` function.
 #'
 #' @return A numeric value representing the selected gamma that minimizes the
-#'   specified performance measure (default is MSE).
+#'   empirical MSE.
 #'
 #' @examples
 #' # This example illustrates the use of the Fisher Randomization Test (FRT)
 #' # and different borrowing methods for hybrid controlled trials.
-#'
+#' \dontrun{
 #' library(intFRT)
 #'
 #' # Simulate data for a hybrid controlled trial
@@ -59,14 +60,15 @@
 #' # Observed outcome
 #' Y <- A * Y1 + (1 - A) * Y0
 #'
-#' # Compute adaptive gamma (with a small n_rep_gamma for illustration)
+#' # Compute adaptive gamma
 #' ada_g <- compute_ada_gamma(
 #'   Y, A, S, X,
-#'   # Use a small n_rep_gamma for fast illustration;
-#'   # recommend n_rep_gamma = 100 for more stable results
-#'   n_rep_gamma = 10
+#'   # Tuning with 20 replications for illustration purposes
+#'   # Recommend setting `n_rep_gamma = 100` or higher with parallel computing
+#'   n_rep_gamma = 20
 #' )
 #' ada_g
+#' }
 #'
 #' @import tibble
 #' @import dplyr
@@ -74,42 +76,305 @@
 #' @export
 compute_ada_gamma <- function(Y, A, S, X,
                               family = "gaussian",
-                              gamma_grid = c(0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1),
-                              measure = "mse_hat", n_rep_gamma = 100,
-                              parallel = F,
-                              n_cores = parallel::detectCores(logical = FALSE),
+                              gamma_grid = seq(0, 1, by = 0.1),
+                              n_rep_gamma = 100,
+                              parallel = FALSE,
+                              n_cores = NULL,
+                              opt = "mse",
+                              sig_level = 0.05,
                               ...) {
-  if (!parallel) {n_cores <- 1}
-  res_grid <- parallel::mclapply(gamma_grid, function(g) {
-    dat_rct <- tibble(Y, A, S, X) %>% filter(S == 1)
-    dat_ec <- tibble(Y, A, S, X) %>% filter(S == 0)
-    n_rt1 <- floor(0.5 * sum(dat_rct$A == 1))
-    n_rc1 <- floor(0.5 * sum(dat_rct$A == 0))
-    est_rep <- map(1:n_rep_gamma, ~ {
-      fold1_id <- c(
-        sample(which(dat_rct$A == 1), size = n_rt1),
-        sample(which(dat_rct$A == 0), size = n_rc1)
-      )
-      dat1 <- bind_rows(dat_rct[fold1_id,], dat_ec)
-      dat2 <- bind_rows(dat_rct[-fold1_id,], dat_ec)
-      est_csb <- ec_borrow(
-        dat1$Y, dat1$A, dat1$S, dat1$X,
-        "Conformal Selective Borrow AIPW", family, n_fisher = NULL,
-        gamma_sel = g, ...
-      )$res$est[1]
-      est_nb <- ec_borrow(
-        dat2$Y, dat2$A, dat2$S, dat2$X,
-        "No Borrow AIPW", family, n_fisher = NULL
-      )$res$est[1]
-      lst(est_csb, est_nb)
+  if (parallel) {
+    if (is.null(n_cores)) {
+      n_cores <- future::availableCores(logical = FALSE)
+    }
+    future::plan(multisession, workers = n_cores)
+  }
+
+  if (any(gamma_grid == 1)) {
+    id_nb <- which(gamma_grid == 1)
+  } else {
+    gamma_grid <- c(gamma_grid, 1)
+    id_nb <- which(gamma_grid == 1)
+  }
+
+  # data
+  dat_rct <- tibble(Y, A, S, X) %>% filter(S == 1)
+  dat_ec <- tibble(Y, A, S, X) %>% filter(S == 0)
+  dat_full <- bind_rows(dat_rct, dat_ec)
+  n_rct <- nrow(dat_rct)
+  n_full <- nrow(dat_full)
+
+  # main algorithm, the other two only for testing
+  if (opt == "mse" & !is.null(n_rep_gamma)) {
+    # bootstrap data sets
+    dat_rep <- map(1:n_rep_gamma, ~ {
+      dat_rct_boot <- dat_rct %>%
+        group_by(A) %>%
+        slice_sample(prop = 1, replace = T)
+      bind_rows(dat_rct_boot, dat_ec)
     })
-    var_hat <- map_dbl(est_rep, ~ {.$est_csb}) %>% var
-    bias2_hat <- mean(map_dbl(est_rep, ~ {.$est_csb - .$est_nb}), na.rm = T)^2
-    mse_hat <- var_hat + bias2_hat
+    # estimators
+    if (parallel) {
+      est_grid <- furrr::future_map(gamma_grid, function(g) {
+        est_one <- tryCatch({
+          ec_borrow(
+            dat_full$Y, dat_full$A, dat_full$S, dat_full$X,
+            "Conformal Selective Borrow AIPW", family, n_fisher = NULL,
+            gamma_sel = g, ...
+          )$res$est[1]
+        }, error = function(e) NA)
+
+        if (!is.na(est_one)) {
+          est_rep <- map(dat_rep, ~ {
+            est_csb <- tryCatch({
+              ec_borrow(
+                .$Y, .$A, .$S, .$X,
+                "Conformal Selective Borrow AIPW", family, n_fisher = NULL,
+                gamma_sel = g, ...
+              )$res$est[1]
+            }, error = function(e) est_one)
+
+            est_csb
+          })
+        } else {
+          est_rep <- NA
+        }
+
+        lst(est_one, est_rep)
+      }, .options = furrr::furrr_options(seed = TRUE))
+    } else {
+      est_grid <- map(gamma_grid, function(g) {
+        est_one <- tryCatch({
+          ec_borrow(
+            dat_full$Y, dat_full$A, dat_full$S, dat_full$X,
+            "Conformal Selective Borrow AIPW", family, n_fisher = NULL,
+            gamma_sel = g, ...
+          )$res$est[1]
+        }, error = function(e) NA)
+
+        if (!is.na(est_one)) {
+          est_rep <- map(dat_rep, ~ {
+            est_csb <- tryCatch({
+              ec_borrow(
+                .$Y, .$A, .$S, .$X,
+                "Conformal Selective Borrow AIPW", family, n_fisher = NULL,
+                gamma_sel = g, ...
+              )$res$est[1]
+            }, error = function(e) est_one)
+
+            est_csb
+          })
+        } else {
+          est_rep <- NA
+        }
+
+        lst(est_one, est_rep)
+      })
+    }
+
+    # MSE
+    res_grid <- map2(est_grid, gamma_grid, function(est_g, g) {
+      if (!is.na(est_g$est_one)) {
+        var_hat <- map_dbl(est_g$est_rep, ~ .) %>% var
+        if (g == 1) {
+          bias2_hat <- 0
+        } else {
+          bias2_hat <- max(
+            (est_g$est_one - est_grid[[id_nb]]$est_one)^2 -
+              map2_dbl(est_g$est_rep, est_grid[[id_nb]]$est_rep,
+                       function(x, y) {x - y}) %>% var,
+            0
+          )
+        }
+        mse_hat <- bias2_hat + var_hat
+
+        # print
+        cat(sprintf("Gamma = %.2f | MSE = %.4f\n", g, mse_hat))
+        lst(mse_hat, bias2_hat, var_hat)
+      } else {
+        # print
+        cat(sprintf("Gamma = %.2f | Error\n", g))
+        lst(mse_hat = Inf, bias2_hat = Inf, var_hat = Inf)
+      }
+    })
     # output
-    cat(paste0("For gamma_sel = ", g,
-               ", MSE = ", mse_hat, "\n\n"))
-    lst(mse_hat, var_hat, bias2_hat)
-  }, mc.cores = n_cores)
-  gamma_grid[which.min(map_dbl(res_grid, measure))]
+    out <- gamma_grid[which.min(map_dbl(res_grid, "mse_hat"))]
+  }
+
+  # for testing
+  if (opt == "mse" & is.null(n_rep_gamma)) {
+    # sandwich variance estimator, not recommend for this purpose
+    # est
+    if (parallel) {
+      est_grid <- furrr::future_map(gamma_grid, function(g) {
+        fit <- ec_borrow(
+          dat_full$Y, dat_full$A, dat_full$S, dat_full$X,
+          "Conformal Selective Borrow AIPW", family, n_fisher = NULL,
+          gamma_sel = g, ...
+        )
+        est_one <- fit$out$est
+        est_se <- fit$out$se
+        est_d <- fit$out$d[[1]]
+        lst(est_one, est_se, est_d)
+      }, .options = furrr::furrr_options(seed = TRUE))
+    } else {
+      est_grid <- map(gamma_grid, function(g) {
+        fit <- ec_borrow(
+          dat_full$Y, dat_full$A, dat_full$S, dat_full$X,
+          "Conformal Selective Borrow AIPW", family, n_fisher = NULL,
+          gamma_sel = g, ...
+        )
+        est_one <- fit$out$est
+        est_se <- fit$out$se
+        est_d <- fit$out$d[[1]]
+        lst(est_one, est_se, est_d)
+      })
+    }
+
+    # MSE
+    res_grid <- map2(est_grid, gamma_grid, function(est_g, g) {
+      d_g <- est_g$est_d
+      d_0 <- est_grid[[id_nb]]$est_d
+      d_dif <- d_g - c(d_0, rep(0, length(d_g) - length(d_0)))
+      var_dif_hat <- sum((d_dif - mean(d_dif))^2) / n_rct / n_full
+      #var_hat <- sum((d_g - mean(d_g))^2) / n_rct / n_full
+      var_hat <- est_g$est_se^2
+      if (g == 1) {
+        bias2_hat <- 0
+      } else {
+        bias2_hat <- max(
+          (est_g$est_one - est_grid[[id_nb]]$est_one)^2 - var_dif_hat,
+          0
+        )
+      }
+      mse_hat <- bias2_hat + var_hat
+
+      # output
+      cat(paste0("For gamma_sel = ", g, ", MSE = ", mse_hat, "\n\n"))
+      lst(mse_hat, bias2_hat, var_hat)
+    })
+    # output
+    out <- gamma_grid[which.min(map_dbl(res_grid, "mse_hat"))]
+  }
+
+  # for testing
+  if (opt == "power") {
+    if (parallel) {
+      power_hat <- furrr::future_map(gamma_grid, function(g) {
+        # distribution of T under H0
+        res_H0 <- ec_borrow(
+          dat_full$Y, dat_full$A, dat_full$S, dat_full$X,
+          "Conformal Selective Borrow AIPW", family, n_fisher = n_rep_gamma,
+          gamma_sel = g, output_frt = TRUE
+        )
+        T_H0 <- res_H0$out_frt$est
+        # CATE estimation
+        #taux <- mean(dat_rct$Y[dat_rct$A == 1]) - mean(dat_rct$Y[dat_rct$A == 0])
+        cate_fit <- grf::causal_forest(X = dat_rct$X, Y = dat_rct$Y,
+                                       W = dat_rct$A)
+        cate <- predict(cate_fit)
+        taux <- cate$predictions
+        # impute potential outcome under H1
+        dat_imp_H1 <- dat_full %>%
+          mutate(
+            Y1 = case_when(
+              A == 1 ~ Y,
+              A == 0 ~ Y + taux
+            ),
+            Y0 = case_when(
+              A == 0 ~ Y,
+              A == 1 ~ Y - taux
+            )
+          )
+        # distribution of T under H0
+        T_H1 <- map_dbl(1:n_rep_gamma, ~ {
+          dat_H1 <- dat_imp_H1 %>%
+            mutate(
+              A = {A[S == 1] <- sample(A[S == 1]); A},
+              Y = A * Y1 + (1 - A) * Y0
+            )
+          res_H1 <- ec_borrow(
+            dat_H1$Y, dat_H1$A, dat_H1$S, dat_H1$X,
+            "Conformal Selective Borrow AIPW", family, n_fisher = NULL,
+            gamma_sel = g, output_frt = TRUE
+          )
+          res_H1$res$est[1]
+        })
+        # bind_rows(
+        #   tibble(type = "H0", t = T_H0),
+        #   tibble(type = "H1", t = T_H1)
+        # ) %>%
+        #   ggplot(aes(t, fill = type)) +
+        #   geom_histogram()
+        critical_value <- quantile(abs(T_H0), probs = 1 - sig_level)
+        power_hat_g <- mean(T_H1 > critical_value) # estimated power
+        # output
+        power_hat_g
+      }, .options = furrr::furrr_options(seed = TRUE)) %>% map_dbl(~.)
+    } else {
+      power_hat <- map(gamma_grid, function(g) {
+        # distribution of T under H0
+        res_H0 <- ec_borrow(
+          dat_full$Y, dat_full$A, dat_full$S, dat_full$X,
+          "Conformal Selective Borrow AIPW", family, n_fisher = n_rep_gamma,
+          gamma_sel = g, output_frt = TRUE
+        )
+        T_H0 <- res_H0$out_frt$est
+        # CATE estimation
+        #taux <- mean(dat_rct$Y[dat_rct$A == 1]) - mean(dat_rct$Y[dat_rct$A == 0])
+        cate_fit <- grf::causal_forest(X = dat_rct$X, Y = dat_rct$Y,
+                                       W = dat_rct$A)
+        cate <- predict(cate_fit)
+        taux <- cate$predictions
+        # impute potential outcome under H1
+        dat_imp_H1 <- dat_full %>%
+          mutate(
+            Y1 = case_when(
+              A == 1 ~ Y,
+              A == 0 ~ Y + taux
+            ),
+            Y0 = case_when(
+              A == 0 ~ Y,
+              A == 1 ~ Y - taux
+            )
+          )
+        # distribution of T under H0
+        T_H1 <- map_dbl(1:n_rep_gamma, ~ {
+          dat_H1 <- dat_imp_H1 %>%
+            mutate(
+              A = {A[S == 1] <- sample(A[S == 1]); A},
+              Y = A * Y1 + (1 - A) * Y0
+            )
+          res_H1 <- ec_borrow(
+            dat_H1$Y, dat_H1$A, dat_H1$S, dat_H1$X,
+            "Conformal Selective Borrow AIPW", family, n_fisher = NULL,
+            gamma_sel = g, output_frt = TRUE
+          )
+          res_H1$res$est[1]
+        })
+        # bind_rows(
+        #   tibble(type = "H0", t = T_H0),
+        #   tibble(type = "H1", t = T_H1)
+        # ) %>%
+        #   ggplot(aes(t, fill = type)) +
+        #   geom_histogram()
+        critical_value <- quantile(abs(T_H0), probs = 1 - sig_level)
+        power_hat_g <- mean(T_H1 > critical_value) # estimated power
+        # output
+        power_hat_g
+      }) %>% map_dbl(~.)
+    }
+    # print
+    walk2(gamma_grid, power_hat, function(g, power_hat_g) {
+      cat(paste0("For gamma_sel = ", g, ", power = ", power_hat_g, "\n\n"))
+    })
+    # output
+    out <- gamma_grid[which.max(power_hat)]
+  }
+
+  if (parallel) {
+    future::plan(sequential)
+  }
+
+  return(out)
 }

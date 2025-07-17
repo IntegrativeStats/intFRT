@@ -40,18 +40,27 @@
 #'   Default is "cv+", with other options being "split", "full", and
 #'   "jackknife+".
 #' @param cf_score Character string specifying the scoring function for
-#'   conformal inference. Default is "AR" for absolute residuals. Another option
-#'   is "CQR" for conformal quantile regression.
+#'   conformal inference. Default is "CQR" for conformal quantile regression.
+#'   Another option is "AR" for absolute residuals.
 #' @param cf_model Character string specifying the model to use for outcome
 #'   prediction in conformal inference. Default is "glm" for generalized linear
-#'   model. Another option is "rf" for random forest.
+#'   model. Other options are "rf" for random forest and "ral" for relaxed
+#'   adaptive lasso.
 #' @param split_train Numeric value (between 0 and 1) specifying the proportion
 #'   of data to use for training when `cf = "split"`. Default is 0.75.
 #' @param cv_fold Integer specifying the number of folds for cross-validation
 #'   when `cf = "cv+"`. Default is 10.
 #' @param outcome_model Character string specifying the model to use for outcome
 #'   imputation in OM/AIPW/ACW methods. Default is "glm" for generalized linear
-#'   model. Another option is "rf" for random forest.
+#'   model. Other options are "rf" for random forest and "ral" for relaxed
+#'   adaptive lasso.
+#' @param sampling_model Character string specifying the model to use for
+#'   sampling model. Default is "glm" for generalized linear model.
+#'   Other options are "rf" for random forest and "ral" for relaxed adaptive
+#'   lasso.
+#' @param X_cw_ind Integer vector of column indices in `X` to balance using
+#' calibration weighting. Default is `NULL`: uses all columns, or applies
+#' data-adaptive selection if `sampling_model = "ral"`.
 #' @param max_r Numeric value limiting the ratio of residual variances between
 #'   trial and external control groups. Default is `Inf` (no restriction).
 #' @param sig_level Numeric significance level for hypothesis tests. Default is
@@ -65,7 +74,7 @@
 #'   Default is `FALSE`.
 #' @param n_cores Integer specifying the number of cores to use for parallel
 #'   computing. Default is the number of available physical cores on the
-#'   machine, as determined by `parallel::detectCores(logical = FALSE)`.
+#'   machine, as determined by `future::availableCores(logical = FALSE)`.
 #' @param output_frt Logical value indicating whether to output all test
 #'   statistic values from the Fisher randomization test. Default is `FALSE`.
 #'
@@ -93,7 +102,7 @@
 #' @examples
 #' # This example illustrates the use of the Fisher Randomization Test (FRT)
 #' # and different borrowing methods for hybrid controlled trials.
-#'
+#' \dontrun{
 #' library(intFRT)
 #'
 #' # Simulate data for a hybrid controlled trial
@@ -144,11 +153,10 @@
 #' # Compute adaptive gamma (with a small n_rep_gamma for illustration)
 #' ada_g <- compute_ada_gamma(
 #'   Y, A, S, X,
-#'   # Use a small n_rep_gamma for fast illustration;
-#'   # recommend n_rep_gamma = 100 for more stable results
-#'   n_rep_gamma = 10
+#'   # Tuning with 20 replications for illustration purposes
+#'   # Recommend setting `n_rep_gamma = 100` or higher with parallel computing
+#'   n_rep_gamma = 20
 #' )
-#' ada_g
 #'
 #' # Perform Fisher Randomization Test with Conformal Selective Borrowing
 #' result_csb <- ec_borrow(
@@ -216,6 +224,7 @@
 #'               fill = "grey80", alpha = 0.5) +
 #'   geom_point(aes(`Sampling Score`, Y, color = Type)) +
 #'   scale_color_manual(values = c("#5A5A5A", "#00ADFA", "#F8766D"))
+#' }
 #'
 #' @import tibble
 #' @import dplyr
@@ -233,21 +242,46 @@ ec_borrow <- function(
     # CSB
     gamma_sel = 0.6,
     cf = "cv+",
-    cf_score = "AR",
+    cf_score = "CQR",
     cf_model = "glm",
     split_train = 0.75,
     cv_fold = 10,
     # AIPW
     outcome_model = "glm",
+    sampling_model = "glm",
+    X_cw_ind = NULL,
     max_r = Inf,
     # testing
     sig_level = 0.05,
     small_n_adj = TRUE,
     # computing & output
     parallel = FALSE,
-    n_cores = parallel::detectCores(logical = FALSE),
+    n_cores = NULL,
     output_frt = FALSE
 ) {
+  if (parallel) {
+    rlang::check_installed("future", reason = "to set execution plan for `furrr`")
+    rlang::check_installed("furrr", reason = "to use `furrr::future_map()` for parallel execution")
+    if (is.null(n_cores)) {
+      n_cores <- future::availableCores(logical = FALSE)
+    }
+    future::plan(multisession, workers = n_cores)
+  }
+
+  if ("ral" %in% c(outcome_model, sampling_model))
+    rlang::check_installed("glmnet", reason = "to use `glmnet::cv.glmnet()` for 'ral'")
+
+  if ("rf" %in% c(outcome_model, sampling_model))
+    rlang::check_installed("randomForest", reason = "to use `randomForest()` for 'rf'")
+
+  if (cf_model == "ral")
+    rlang::check_installed("rqPen", reason = "to use `rq.pen.cv()` for cf_model = 'ral'")
+
+  if (cf_model == "rf")
+    rlang::check_installed("grf", reason = "to use `quantile_forest()` for cf_model = 'rf'")
+
+  if (cf_score == "NN")
+    rlang::check_installed("RANN", reason = "to use `nn2()` for cf_score = 'NN'")
 
   dat_origin <- tibble(Y, A, S, X)
   rm(Y, A, S, X)
@@ -478,7 +512,32 @@ ec_borrow <- function(
         r <- 1
       }
       # compute qhat
-      qhat <- compute_cw(dat$S, dat$X)
+      if (is.null(X_cw_ind)) { # no user-specified X_cw
+        if (sampling_model == "ral") { # data-adaptive X_cw by outcome-adaptive lasso
+          if (is.null(X_cw_ind)) {
+            X_cw_ind_rc <- pred_model(
+              dat %>% filter(A == 0, S == 1),
+              dat %>% filter(A == 0, S == 1),
+              family, base_model = "ral", var_sel = TRUE
+            )
+            X_cw_ind_ec <- pred_model(
+              dat %>% filter(A == 0, S == 0),
+              dat %>% filter(A == 0, S == 0),
+              family, base_model = "ral", var_sel = TRUE
+            )
+            X_cw_ind <- union(X_cw_ind_rc, X_cw_ind_ec)
+            X_cw <- dat$X[, X_cw_ind, drop = FALSE]
+          }
+        } else { # use all X
+          X_cw <- dat$X
+        }
+      } else { # user-specified X_cw
+        X_cw <- dat$X[, X_cw_ind, drop = FALSE]
+      }
+      # calibration weighting
+      qhat <- compute_cw(dat$S, X_cw)
+
+      # compute weight
       w0init <- with(
         dat,
         qhat * (S * (1 - A) + (1 - S) * r) / (qhat * (1 - pA) + r)
@@ -504,7 +563,8 @@ ec_borrow <- function(
 
   if (identical(method, "Borrow AIPW")) {
     est_fun <- function(dat) {
-      rct_ec_aipw_acw(dat, family, outcome_model, max_r, small_n_adj) %>%
+      rct_ec_aipw_acw(dat, family, outcome_model, max_r, small_n_adj,
+                      sampling_model) %>%
         # borrow all ECs
         mutate(id_sel = list(which(dat$S == 0)))
     }
@@ -513,11 +573,32 @@ ec_borrow <- function(
 
   if (identical(method, "Borrow ACW")) {
     est_fun <- function(dat) {
-      rct_ec_aipw_acw(dat, family, outcome_model, max_r, small_n_adj, cw = TRUE) %>%
+      rct_ec_aipw_acw(dat, family, outcome_model, max_r, small_n_adj,
+                      sampling_model, cw = TRUE, X_cw_ind = X_cw_ind) %>%
         # borrow all ECs
         mutate(id_sel = list(which(dat$S == 0)))
     }
     gamma_sel <- 0
+  }
+
+  if (identical(method, "AdaLasso Selective Borrow ACW")) { # Chenyin's method
+    rlang::check_installed("SelectiveIntegrative", reason = "to use `srEC()`")
+    est_fun <- function(dat) {
+      fit <- with(dat,
+                  SelectiveIntegrative::srEC(
+                    data_rt = list(X = X[S == 1,], Y = Y[S == 1], A = A[S == 1]),
+                    data_ec = list(list(X = X[S == 0,], Y = Y[S == 0], A = A[S == 0])),
+                    method = "glm"
+                  )
+      )
+      tibble(
+        est = as.vector(fit$est$ACW.final),
+        se = as.vector(fit$sd$ACW.final) / sqrt(fit$n_c),
+        ess_sel = NA,
+        id_sel = list(which(dat$S == 0)[fit$subset.idx])
+      )
+    }
+    gamma_sel <- NA
   }
 
   if (identical(method, c("Conformal Selective Borrow AIPW"))) { # proposed method
@@ -531,7 +612,7 @@ ec_borrow <- function(
         cf, cf_score, cf_model, split_train, cv_fold, sig_level
       )
       # biased or unbiased
-      bias_ec <- ifelse(p_cf >= gamma_sel, 0, 1)
+      bias_ec <- ifelse(p_cf > gamma_sel, 0, 1)
       # estimation
       if (sum(bias_ec == 0) < 5) {
         # if n_sel < 5, do not borrow anyone
@@ -545,7 +626,8 @@ ec_borrow <- function(
         bias <- rep(0, nrow(dat))
         bias[dat$S == 0] <- bias_ec
         dat_sel <- dat %>% filter(bias == 0)
-        rct_ec_aipw_acw(dat_sel, family, outcome_model, max_r, small_n_adj) %>%
+        rct_ec_aipw_acw(dat_sel, family, outcome_model, max_r, small_n_adj,
+                        sampling_model) %>%
           mutate(id_sel = list(which(dat$S == 0 & bias == 0)))
       }
     }
@@ -562,7 +644,7 @@ ec_borrow <- function(
         cf, cf_score, cf_model, split_train, cv_fold, sig_level
       )
       # biased or unbiased
-      bias_ec <- ifelse(p_cf >= gamma_sel, 0, 1)
+      bias_ec <- ifelse(p_cf > gamma_sel, 0, 1)
       # estimation
       if (sum(bias_ec == 0) < 5) {
         # if n_sel < 5, do not borrow anyone
@@ -576,7 +658,8 @@ ec_borrow <- function(
         bias <- rep(0, nrow(dat))
         bias[dat$S == 0] <- bias_ec
         dat_sel <- dat %>% filter(bias == 0)
-        rct_ec_aipw_acw(dat_sel, family, outcome_model, max_r, small_n_adj, cw = TRUE) %>%
+        rct_ec_aipw_acw(dat_sel, family, outcome_model, max_r, small_n_adj,
+                        sampling_model, cw = TRUE, X_cw_ind = X_cw_ind) %>%
           mutate(id_sel = list(which(dat$S == 0 & bias == 0)))
       }
     }
@@ -598,7 +681,7 @@ ec_borrow <- function(
         if (parallel) {
           cat(paste0("parallel computing enabled with ", n_cores,
                      " cores for bootstrap SE of ", method, "\n\n"))
-          out_boot <- parallel::mclapply(1:n_boot, function(i) {
+          out_boot <- furrr::future_map(1:n_boot, function(i) {
             dat_boot <- dat_origin %>%
               group_by(A, S) %>%
               slice_sample(prop = 1, replace = TRUE) %>%
@@ -608,7 +691,7 @@ ec_borrow <- function(
             }, error = function(e) {
               NA
             })
-          }, mc.cores = n_cores) %>%
+          }, .options = furrr::furrr_options(seed = TRUE)) %>%
             map_dbl(~.)
         } else {
           out_boot <- map_dbl(1:n_boot, ~ {
@@ -703,7 +786,7 @@ ec_borrow <- function(
           cat(paste0("parallel computing enabled with ", n_cores,
                      " cores for ", method, "+FRT\n\n"))
           # randomization
-          out_frt <- parallel::mclapply(1:n_fisher, function(i) {
+          out_frt <- furrr::future_map(1:n_fisher, function(i) {
             dat_rand <- dat_origin %>%
               mutate(A = {A[S == 1] <- sample(A[S == 1]); A})
             tryCatch({
@@ -711,11 +794,8 @@ ec_borrow <- function(
             }, error = function(e) {
               NULL
             })
-          }, mc.cores = n_cores) %>%
-            map_dfr(~.) %>%
-            mutate(
-              cond = floor(map_dbl(id_sel, length) / 10) == floor(res$n_sel / 10)
-            )
+          }, .options = furrr::furrr_options(seed = TRUE)) %>%
+            map_dfr(~.)
         } else {
           # randomization
           out_frt <- map_dfr(1:n_fisher, ~{
@@ -762,6 +842,11 @@ ec_borrow <- function(
     n_ec = dat_origin %>% filter(A == 0, S == 0) %>% nrow,
     id_ec = list(which(dat_origin$S == 0))
   )
+
+  if (parallel) {
+    future::plan(sequential)
+  }
+
   if (output_frt) {
     lst(res, id_sel = out$id_sel[[1]], dat_info, gamma_sel, out, out_frt)
   } else {
