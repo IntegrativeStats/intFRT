@@ -10,11 +10,12 @@ compute_ada_gamma(
   S,
   X,
   family = "gaussian",
-  gamma_grid = c(0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1),
-  measure = "mse_hat",
+  gamma_grid = seq(0, 1, by = 0.1),
   n_rep_gamma = 100,
-  parallel = F,
-  n_cores = parallel::detectCores(logical = FALSE),
+  parallel = FALSE,
+  n_cores = NULL,
+  opt = "mse",
+  sig_level = 0.05,
   ...
 )
 }
@@ -29,30 +30,32 @@ data, 0 for external control data).}
 \item{X}{Matrix of covariates.}
 
 \item{family}{A description of the outcome type. Default is "gaussian" for
-continuous outcomes, but can also be "binomial" for binary outcomes.}
+continuous outcomes.}
 
 \item{gamma_grid}{Numeric vector representing the grid of potential gamma
 values to search over. Default is a sequence from 0 to 1 with 11 grids.}
 
-\item{measure}{The performance metric to be minimized. Default is "mse_hat".
-Other options include "var_hat" and "bias2_hat", but these are only for
-comparison purposes and not recommended for actual selection.}
-
-\item{n_rep_gamma}{Integer specifying the number of data-splitting iterations
-for estimating the measure given a certain gamma. Default is 100.}
+\item{n_rep_gamma}{Integer specifying the number of resampling iterations
+for estimating the MSE given a certain gamma. Default is \code{10}.}
 
 \item{parallel}{Logical value indicating whether to use parallel computing.
 Default is \code{FALSE}.}
 
 \item{n_cores}{Integer specifying the number of cores to use for parallel
 computing. Default is the number of available physical cores on the
-machine, as determined by \code{parallel::detectCores(logical = FALSE)}.}
+machine, as determined by \code{future::availableCores(logical = FALSE)}.}
+
+\item{opt}{Character specifying the criterion to determine gamma. Options are
+"power" or "mse". Default is "mse".}
+
+\item{sig_level}{Numeric value indicating the significance level for
+hypothesis tests when \code{opt = "power"}. Default is 0.05.}
 
 \item{...}{Additional arguments passed to the internal \code{ec_borrow} function.}
 }
 \value{
 A numeric value representing the selected gamma that minimizes the
-specified performance measure (default is MSE).
+empirical MSE.
 }
 \description{
 This function adaptively determines the threshold (gamma) to minimize the
@@ -61,7 +64,7 @@ Mean Squared Error (MSE) when performing Conformal Selective Borrowing.
 \examples{
 # This example illustrates the use of the Fisher Randomization Test (FRT)
 # and different borrowing methods for hybrid controlled trials.
-
+\dontrun{
 library(intFRT)
 
 # Simulate data for a hybrid controlled trial
@@ -90,13 +93,14 @@ Y0[id_biased_EC] <- Y0[id_biased_EC] - 10
 # Observed outcome
 Y <- A * Y1 + (1 - A) * Y0
 
-# Compute adaptive gamma (with a small n_rep_gamma for illustration)
+# Compute adaptive gamma
 ada_g <- compute_ada_gamma(
   Y, A, S, X,
-  # Use a small n_rep_gamma for fast illustration;
-  # recommend n_rep_gamma = 100 for more stable results
-  n_rep_gamma = 10
+  # Tuning with 20 replications for illustration purposes
+  # Recommend setting `n_rep_gamma = 100` or higher with parallel computing
+  n_rep_gamma = 20
 )
 ada_g
+}
 
 }

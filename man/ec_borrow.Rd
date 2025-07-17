@@ -15,16 +15,18 @@ ec_borrow(
   n_boot = NULL,
   gamma_sel = 0.6,
   cf = "cv+",
-  cf_score = "AR",
+  cf_score = "CQR",
   cf_model = "glm",
   split_train = 0.75,
   cv_fold = 10,
   outcome_model = "glm",
+  sampling_model = "glm",
+  X_cw_ind = NULL,
   max_r = Inf,
   sig_level = 0.05,
   small_n_adj = TRUE,
   parallel = FALSE,
-  n_cores = parallel::detectCores(logical = FALSE),
+  n_cores = NULL,
   output_frt = FALSE
 )
 }
@@ -75,12 +77,13 @@ Default is "cv+", with other options being "split", "full", and
 "jackknife+".}
 
 \item{cf_score}{Character string specifying the scoring function for
-conformal inference. Default is "AR" for absolute residuals. Another option
-is "CQR" for conformal quantile regression.}
+conformal inference. Default is "CQR" for conformal quantile regression.
+Another option is "AR" for absolute residuals.}
 
 \item{cf_model}{Character string specifying the model to use for outcome
 prediction in conformal inference. Default is "glm" for generalized linear
-model. Another option is "rf" for random forest.}
+model. Other options are "rf" for random forest and "ral" for relaxed
+adaptive lasso.}
 
 \item{split_train}{Numeric value (between 0 and 1) specifying the proportion
 of data to use for training when \code{cf = "split"}. Default is 0.75.}
@@ -90,7 +93,17 @@ when \code{cf = "cv+"}. Default is 10.}
 
 \item{outcome_model}{Character string specifying the model to use for outcome
 imputation in OM/AIPW/ACW methods. Default is "glm" for generalized linear
-model. Another option is "rf" for random forest.}
+model. Other options are "rf" for random forest and "ral" for relaxed
+adaptive lasso.}
+
+\item{sampling_model}{Character string specifying the model to use for
+sampling model. Default is "glm" for generalized linear model.
+Other options are "rf" for random forest and "ral" for relaxed adaptive
+lasso.}
+
+\item{X_cw_ind}{Integer vector of column indices in \code{X} to balance using
+calibration weighting. Default is \code{NULL}: uses all columns, or applies
+data-adaptive selection if \code{sampling_model = "ral"}.}
 
 \item{max_r}{Numeric value limiting the ratio of residual variances between
 trial and external control groups. Default is \code{Inf} (no restriction).}
@@ -109,7 +122,7 @@ Default is \code{FALSE}.}
 
 \item{n_cores}{Integer specifying the number of cores to use for parallel
 computing. Default is the number of available physical cores on the
-machine, as determined by \code{parallel::detectCores(logical = FALSE)}.}
+machine, as determined by \code{future::availableCores(logical = FALSE)}.}
 
 \item{output_frt}{Logical value indicating whether to output all test
 statistic values from the Fisher randomization test. Default is \code{FALSE}.}
@@ -152,7 +165,7 @@ inference results based on asymptotic normality for comparison (see the
 \examples{
 # This example illustrates the use of the Fisher Randomization Test (FRT)
 # and different borrowing methods for hybrid controlled trials.
-
+\dontrun{
 library(intFRT)
 
 # Simulate data for a hybrid controlled trial
@@ -203,11 +216,10 @@ result_nb$id_sel
 # Compute adaptive gamma (with a small n_rep_gamma for illustration)
 ada_g <- compute_ada_gamma(
   Y, A, S, X,
-  # Use a small n_rep_gamma for fast illustration;
-  # recommend n_rep_gamma = 100 for more stable results
-  n_rep_gamma = 10
+  # Tuning with 20 replications for illustration purposes
+  # Recommend setting `n_rep_gamma = 100` or higher with parallel computing
+  n_rep_gamma = 20
 )
-ada_g
 
 # Perform Fisher Randomization Test with Conformal Selective Borrowing
 result_csb <- ec_borrow(
@@ -275,5 +287,6 @@ dat_plot \%>\%
               fill = "grey80", alpha = 0.5) +
   geom_point(aes(`Sampling Score`, Y, color = Type)) +
   scale_color_manual(values = c("#5A5A5A", "#00ADFA", "#F8766D"))
+}
 
 }
